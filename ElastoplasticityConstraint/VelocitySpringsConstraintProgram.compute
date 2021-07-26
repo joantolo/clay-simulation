@@ -1,0 +1,463 @@
+#pragma kernel KerGenerateConstraints
+#pragma kernel KerUpdatePartLastVelocities
+#pragma kernel KerUpdateConstraints
+#pragma kernel KerRearrangeConstraints
+#pragma kernel KerCountParticleConstraints
+#pragma kernel KerStoreParticleConstraints
+#pragma kernel KerComputeDelta
+#pragma kernel KerRearrangeParticles
+#pragma kernel KerRearrangeParticlesU
+
+//== Includes ==============================================================
+
+#include "FluidCommon.cginc"
+
+//== Constants =============================================================
+
+cbuffer VelocitySpringsConstants
+{
+    const float VelocityThreshold;
+    const uint NumSpringConstraints;
+    const uint MaxSpringConstraints;
+    const float DeltaLimit;
+};
+
+//== Buffers ===============================================================
+
+StructuredBuffer<uint2>   ConstraintTupleR;                  // Per constraint, particles involved.
+StructuredBuffer<float>   ConstraintDistanceR;               // Per constraint, rest distance.
+StructuredBuffer<uint>    ConstraintOrderR;                  // Per constraint, order after collapse.
+StructuredBuffer<uint>    ConstraintStencilR;                // Per constraint, stencil.
+StructuredBuffer<uint2>   ConstraintLocalOrderR;             // Per constraint, local order when generating per-particle constraint list.
+
+StructuredBuffer<uint>    PerPartCountR;                     // Number of constraint per particle.
+StructuredBuffer<uint>    PerPartOffsetR;                    // Pointer to first constraint index of each particle
+StructuredBuffer<uint>    PerPartConstraintsR;               // Indices to the constraints.
+StructuredBuffer<float>   PerPartLastUsR;                    // Speeds of last 5 frames per particle.
+StructuredBuffer<float>   PerPartAverageLastUsR;             // Average of the speeds of last 5 frames per particle.
+
+
+RWStructuredBuffer<uint2> ConstraintTupleRW;                // Per constraint, particles involved.
+RWStructuredBuffer<float> ConstraintDistanceRW;             // Per constraint, rest distance.
+RWStructuredBuffer<uint>  ConstraintStencilRW;              // Per constraint, stencil indicating whether or not the constraint exists.
+RWStructuredBuffer<uint2> ConstraintLocalOrderRW;           // Per constraint, local order when generating per-particle constraint list.
+
+RWStructuredBuffer<uint>  PerPartCountRW;                   // Number of constraints per particle.
+RWStructuredBuffer<uint>  PerPartOffsetRW;                  // Pointer to the first constraint index of each particle.
+RWStructuredBuffer<uint>  PerPartConstraintsRW;             // Indices to the constraints.
+RWStructuredBuffer<float> PerPartLastUsRW;                  // Speeds of last 5 frames per particle.
+RWStructuredBuffer<float> PerPartAverageLastUsRW;           // Average of the speeds of last 5 frames per particle.
+
+
+RWStructuredBuffer<uint>  AppendCounterRW;        // Append counter used to atomically generate constraints.
+
+//== Kernels ===============================================================
+
+[numthreads(256, 1, 1)]
+void KerGenerateConstraints(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Particle-centered kernel
+    // No. threads = No. particles
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - PartInfoR
+    // - PartPositionR
+    // - PerPartOffsetR
+    // - PerPartCountR
+    // - ConstraintTupleRW
+    // - ConstraintDistanceRW
+    // - AppendCounterRW (initialized to NumConstraints)
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // ----------------------------------------------------------------------------
+
+    const uint Ii = PartInfoR[i];
+    const uint Gi = GetParticleGroup(Ii);
+
+    if (IsGroupInGroupMask(Gi, BehaviourTargetMask) && !HasParticleFixedFlag(Ii))
+    {
+        const float3 Xi = ReadVector3(PartPositionR, i, MaxParticles, float);
+        const float  TwoH2 = 4.0 * ReadConstArray(H2, Gi); // (2H)^2
+        const uint   StartCi = PerPartOffsetR[i];
+        const uint   EndCi = StartCi + PerPartCountR[i];
+
+        // ----------------------------------------------------------------------------
+
+        BeginForEachNeighbour(i, j, Xi, Xj, Ij, Gj, BehaviourTargetMask)
+        {
+            if (i > j) continue;
+
+            BeginIfWithinRadius(Xi, Xj, XijNorm, XijSqrNorm, Xij, ReadConstArray(H, Gi))
+            {
+                // i and j are neighbours, determine if these particles already
+                // have a constraint linking 'em.
+                // Warning: Terribly slow linear search!
+
+                bool Exists = false;
+
+                for (uint k = StartCi; k < EndCi && !Exists; ++k)
+                {
+                    uint l = PerPartConstraintsR[k];
+                    uint2 Tij = ConstraintTupleRW[l];
+                    Exists = (j == Tij.x) || (j == Tij.y);
+                }
+
+                // If no constraint already exists, append new constraint at the
+                // buffer's end.
+
+                if (Exists == false)
+                {
+                    uint Offs;
+                    InterlockedAdd(AppendCounterRW[0], 1, Offs);
+
+                    if (Offs < MaxSpringConstraints)
+                    {
+                        ConstraintTupleRW[Offs] = uint2(i, j);
+                        ConstraintDistanceRW[Offs] = XijNorm;
+                    }
+                }
+            }
+            EndIfWithinRadius
+        }
+        EndForEachNeighbour
+    }
+    // ----------------------------------------------------------------------------
+}
+
+[numthreads(256, 1, 1)]
+void KerUpdatePartLastVelocities(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Particle-centered kernel
+    // No. threads = No. particles
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - PartInfoR
+    // - PerPartLastUsRW
+    // - PartVelocityR
+    // - PerPartAverageLastUsRW
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // ----------------------------------------------------------------------------
+
+    const uint Ii = PartInfoR[i];
+    const uint Gi = GetParticleGroup(Ii);
+
+    if (IsGroupInGroupMask(Gi, BehaviourTargetMask) && !HasParticleFixedFlag(Ii))
+    {
+        const uint index = i * 4;
+
+        // Update last Velocities
+        float3 lastUsi0 = ReadVector3(PerPartLastUsRW, index + 0, MaxParticles * 4, float);
+        float3 lastUsi1 = ReadVector3(PerPartLastUsRW, index + 1, MaxParticles * 4, float);
+        float3 lastUsi2 = ReadVector3(PerPartLastUsRW, index + 2, MaxParticles * 4, float);
+        float3 lastUsi3 = ReadVector3(PerPartLastUsRW, index + 3, MaxParticles * 4, float);
+
+        const float3 currentUi = ReadVector3(PartVelocityR, i, MaxParticles, float);
+        const float3 averageUi = (lastUsi0 + lastUsi1 + lastUsi2 + lastUsi3 + currentUi) * 0.2;
+
+        WriteVector3(PerPartLastUsRW, index + 0, MaxParticles * 4, currentUi);
+        WriteVector3(PerPartLastUsRW, index + 1, MaxParticles * 4, lastUsi0);
+        WriteVector3(PerPartLastUsRW, index + 2, MaxParticles * 4, lastUsi1);
+        WriteVector3(PerPartLastUsRW, index + 3, MaxParticles * 4, lastUsi2);
+        WriteVector3(PerPartAverageLastUsRW, i, MaxParticles, averageUi);
+    }
+
+    // ----------------------------------------------------------------------------
+}
+
+[numthreads(256, 1, 1)]
+void KerUpdateConstraints(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Constraint-centered kernel
+    // No. threads = No. constraints
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - ConstraintTupleRW
+    // - ConstraintDistanceRW
+    // - PartPositionR
+    // - ConstraintStencilRW
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumSpringConstraints) return;
+
+    // ----------------------------------------------------------------------------
+
+    uint2 Tij = ConstraintTupleRW[i];
+
+    const float3 Xi = ReadVector3(PartPositionR, Tij.x, MaxParticles, float);
+    const float3 Xj = ReadVector3(PartPositionR, Tij.y, MaxParticles, float);
+    const float3 Ui = ReadVector3(PerPartAverageLastUsR, Tij.x, MaxParticles, float);
+    const float3 Uj = ReadVector3(PerPartAverageLastUsR, Tij.y, MaxParticles, float);
+
+    const float3 Xij = Xi - Xj;
+    const float3 Uij = Ui - Uj;
+    const float relativeU = length(Uij);
+    const float projRelativeU = abs(dot(Uij, normalize(Xij)));
+
+    ConstraintStencilRW[i] = projRelativeU < VelocityThreshold;
+
+    // ----------------------------------------------------------------------------
+}
+
+[numthreads(256, 1, 1)]
+void KerRearrangeConstraints(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Constraint-centered kernel
+    // No. threads = No. constraints (PRIOR TO COLLAPSING)
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - ConstraintTupleR
+    // - ConstraintTupleRW
+    // - ConstraintDistanceR
+    // - ConstraintDistanceRW
+    // - PerPartOffsetR (After prefix sum scan of PerPartCountR)
+    // - ConstraintOrderR
+    // - ConstraintStencilR
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumSpringConstraints) return;
+
+    // ----------------------------------------------------------------------------
+
+    uint Stencil = ConstraintStencilR[i];
+
+    // If the constraint is not to be removed...
+
+    if (Stencil != 0)
+    {
+        // Move it around to its new location.
+
+        uint Offs = ConstraintOrderR[i];
+        uint2 Tij = ConstraintTupleR[i];
+        float Dij = ConstraintDistanceR[i];
+
+        ConstraintTupleRW[Offs] = Tij;
+        ConstraintDistanceRW[Offs] = Dij;
+    }
+
+    // ----------------------------------------------------------------------------
+}
+
+[numthreads(256, 1, 1)]
+void KerCountParticleConstraints(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Constraint-centered kernel
+    // No. threads = No. constraints
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - ConstraintTupleR
+    // - PerPartCountRW
+    // - ConstraintLocalOrderRW
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumSpringConstraints) return;
+
+    // ----------------------------------------------------------------------------
+
+    uint2 Tij = ConstraintTupleR[i];
+    uint2 LOij;
+    InterlockedAdd(PerPartCountRW[Tij.x], 1, LOij.x);
+    InterlockedAdd(PerPartCountRW[Tij.y], 1, LOij.y);
+
+    ConstraintLocalOrderRW[i] = LOij;
+}
+
+[numthreads(256, 1, 1)]
+void KerStoreParticleConstraints(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Constraint-centered kernel
+    // No. threads = No. constraints
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - ConstraintTupleR
+    // - ConstraintLocalOrderR
+    // - PerPartOffsetR
+    // - PerPartConstraintsRW
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumSpringConstraints) return;
+
+    // ----------------------------------------------------------------------------
+
+    uint2 Tij = ConstraintTupleR[i];
+    uint2 LOij = ConstraintLocalOrderR[i];
+    uint  Offsi = PerPartOffsetR[Tij.x] + LOij.x;
+    uint  Offsj = PerPartOffsetR[Tij.y] + LOij.y;
+
+    PerPartConstraintsRW[Offsi] = i;
+    PerPartConstraintsRW[Offsj] = i;
+}
+
+[numthreads(256, 1, 1)]
+void KerComputeDelta(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Particle-centered kernel
+    // No. threads = No. particles
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - PartPositionR
+    // - PerPartOffsetR
+    // - ContraintStencilR
+    // - PerPartCountR
+    // - ConstraintTupleR
+    // - ConstraintDistanceR
+    // - PartDeltaRW
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // ----------------------------------------------------------------------------
+
+    const uint Ii = PartInfoR[i];
+    const uint Gi = GetParticleGroup(Ii);
+
+    // ----------------------------------------------------------------------------
+
+    if (IsGroupInGroupMask(Gi, BehaviourTargetMask) && !HasParticleFixedFlag(Ii))
+    {
+        const float3 Xi = ReadVector3(PartPositionR, i, MaxParticles, float);
+        const uint   StartCi = PerPartOffsetR[i];
+        const uint   EndCi = StartCi + PerPartCountR[i];
+
+        float3 dXi = 0.0;
+        uint   Ki = 0;
+
+        // -----------------------------------------------------------------------
+
+        for (uint k = StartCi; k < EndCi; ++k)
+        {
+            const uint l = PerPartConstraintsR[k];
+
+            if (ConstraintStencilR[l] == 0) continue;
+
+            const uint2 Tij = ConstraintTupleR[l];
+            const float Dij = ConstraintDistanceR[l];
+            const uint j = Tij.x == i ? Tij.y : Tij.x;
+
+            const float3 Xj = ReadVector3(PartPositionR, j, MaxParticles, float);
+            const float3 Xij = Xi - Xj;
+            const float  XijNorm = length(Xij);
+
+            float D = Dij - XijNorm;
+            if ((XijNorm > EPSILON)) dXi += 0.5 * D * Xij / XijNorm;  // We assume all particles have same mass so (wi / (wi + wj)) = 0.5
+
+            Ki++;
+        }
+
+        // -----------------------------------------------------------------------
+
+
+        // Finish delta computation.
+        if (Ki > 0)
+        {
+            dXi *= Stiffness; // / Ki;
+
+            if (DeltaLimit > 0)
+            {
+                float deltaLimit = ReadConstArray(H, Gi) * DeltaLimit;
+                dXi = ClampLength(dXi, deltaLimit);
+            }
+
+            AddVector3(PartDeltaRW, i, MaxParticles, dXi);
+        }
+    }
+
+    // ----------------------------------------------------------------------------
+}
+
+[numthreads(256, 1, 1)]
+void KerRearrangeParticles(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Constraint-centered kernel
+    // No. threads = No. constraints
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - ConstraintTupleRW
+    // - PerPartCountRW (Initialized to 0)
+    // - ConstraintOrderRW
+    // - PartOrderOldToNewR
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumSpringConstraints) return;
+
+    // ----------------------------------------------------------------------------
+
+    const uint2 Ti = ConstraintTupleRW[i];
+    const uint  Oi = PartOrderOldToNewR[Ti.x];
+    const uint  Oj = PartOrderOldToNewR[Ti.y];
+
+    // ----------------------------------------------------------------------------
+
+    // If both particles are still valid...
+
+    if (Oi != NULL && Oj != NULL)
+    {
+        // Update tuple indices and update constraint stencil to reflect that it
+        // is still valid.
+
+        ConstraintTupleRW[i] = uint2(Oi, Oj);
+        ConstraintStencilRW[i] = 1;
+    }
+    else
+    {
+        // Otherwise the constraint is no longed valid and has to be removed.
+        // Reflect this in the stencil.
+
+        ConstraintStencilRW[i] = 0;
+    }
+
+    // ----------------------------------------------------------------------------
+}
+
+[numthreads(256, 1, 1)]
+void KerRearrangeParticlesU(const uint3 T : SV_DispatchThreadID)
+{
+    // ============================================================================
+    // Constraint-centered kernel
+    // No. threads = No. particles
+    // ----------------------------------------------------------------------------
+    // Uses buffers:
+    // - PartOrderOldToNewR
+    // - PerPartLastUsRW
+    // - PerPartLastUsR
+    // ============================================================================
+
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // ----------------------------------------------------------------------------
+
+    const uint  j = PartOrderOldToNewR[i];
+
+    const uint indexI = i * 4;
+    const uint indexJ = j * 4;
+
+    // ----------------------------------------------------------------------------
+
+    CopyVector3(PerPartLastUsR, indexI + 0, MaxParticles * 4, PerPartLastUsRW, indexJ + 0, MaxParticles * 4);
+    CopyVector3(PerPartLastUsR, indexI + 1, MaxParticles * 4, PerPartLastUsRW, indexJ + 1, MaxParticles * 4);
+    CopyVector3(PerPartLastUsR, indexI + 2, MaxParticles * 4, PerPartLastUsRW, indexJ + 2, MaxParticles * 4);
+    CopyVector3(PerPartLastUsR, indexI + 3, MaxParticles * 4, PerPartLastUsRW, indexJ + 3, MaxParticles * 4);
+
+    // ----------------------------------------------------------------------------
+}

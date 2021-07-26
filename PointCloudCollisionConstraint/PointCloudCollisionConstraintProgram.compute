@@ -1,0 +1,624 @@
+#pragma kernel KerUpdateGhostParts
+#pragma kernel KerDetectGhostPartContacts
+#pragma kernel KerRearrangeContacts
+#pragma kernel KerComputeDeltaOnPositions
+#pragma kernel KerComputeDeltaOnVelocities
+#pragma kernel KerOrderByNeighbourhood
+#pragma kernel KerRearrangeParticlesA
+#pragma kernel KerRearrangeParticlesB
+#pragma kernel KerFindGhostNeighbours
+#pragma kernel KerInterpolateVertices
+
+//== Includes ==============================================================
+
+#include "../Fluids/FluidCommon.cginc"
+#include "../Core/ParticleCommon.cginc"
+
+//== Constants =============================================================
+
+#define MAX_CONTACTS 1
+
+cbuffer CollisionConstraintConstants
+{
+    const uint  NumGhostParts;
+    const uint  MaxGhostParts;
+    const uint  NumColliders;
+    const float ContactRadius;
+    const float ContactRadiusSqr;
+    const float GhostNeighbourRadius;
+    const float GhostNeighbourRadiusSqr;
+    const float InvGhostNeighbourRadius;
+    const uint  MaxGhostNeighbours;
+    const uint  MaxGhostNeighbourBuckets;
+    const uint  NumVertices;
+    const float InterpolationWeight;
+};
+
+#define TYPE_EXTERIOR 0
+#define TYPE_BOUNDARY 1
+#define TYPE_INTERIOR 2
+
+//== Buffers ===============================================================
+
+StructuredBuffer<float3>    VerticesR;
+RWStructuredBuffer<float3>  VerticesRW;
+StructuredBuffer<float3>    VerticesPrevR;
+StructuredBuffer<float3>    VerticesNextR;
+StructuredBuffer<uint>      TetraIndicesR;
+StructuredBuffer<uint>      SurfaceIndicesR;
+
+StructuredBuffer<float>     GhostPartPositionR;
+StructuredBuffer<float>     GhostPartPositionDeltaR;
+StructuredBuffer<uint>      GhostPartColliderIdR;
+StructuredBuffer<uint>      GhostPartTypeR;
+StructuredBuffer<float>     GhostPartClosestDistR;
+StructuredBuffer<float>     GhostPartClosestDirR;
+StructuredBuffer<uint>      GhostPartTetIdR;
+StructuredBuffer<uint>      GhostPartClosestTriIdR;
+StructuredBuffer<float>     GhostPartTriNTetBarycentricCoordsR;
+StructuredBuffer<uint>      GhostPartIsSurfaceR;
+RWStructuredBuffer<float>   GhostPartPositionRW;
+RWStructuredBuffer<float>   GhostPartPositionDeltaRW;
+RWStructuredBuffer<uint>    GhostPartColliderIdRW;
+RWStructuredBuffer<uint>    GhostPartTypeRW;
+RWStructuredBuffer<float>   GhostPartClosestDistRW;
+RWStructuredBuffer<float>   GhostPartClosestDirRW;
+RWStructuredBuffer<uint>    GhostPartTetIdRW;
+RWStructuredBuffer<uint>    GhostPartClosestTriIdRW;
+RWStructuredBuffer<float>   GhostPartTriNTetBarycentricCoordsRW;
+RWStructuredBuffer<uint>    GhostPartIsSurfaceRW;
+
+StructuredBuffer<float>    ColliderFrictionCoeffR;
+StructuredBuffer<int>      ColliderGhostPartStartR;
+StructuredBuffer<int>      ColliderGhostPartCountR;
+
+StructuredBuffer<uint>     PartCtInfoR;
+RWStructuredBuffer<uint>   PartCtInfoRW;
+
+StructuredBuffer<float>    PartCtPointsNPlanesR;
+RWStructuredBuffer<float>  PartCtPointsNPlanesRW;
+
+StructuredBuffer<float>    PartCtFrictionCoeffR;
+RWStructuredBuffer<float>  PartCtFrictionCoeffRW;
+
+StructuredBuffer<uint>     PartCtCountR;
+RWStructuredBuffer<uint>   PartCtCountRW;
+
+// ---- Particle Neighbouring Data ----
+
+StructuredBuffer<uint2>     GhostNeighbourSearchTuplesR;
+RWStructuredBuffer<uint2>   GhostNeighbourSearchTuplesRW;
+
+StructuredBuffer<uint>      GhostNeighbourSearchOffsetR;
+
+StructuredBuffer<uint>      GhostNeighbourSearchCountR;
+
+StructuredBuffer<uint>      GhostPartOrderOldToNewR;
+StructuredBuffer<uint>      GhostPartOrderNewToOldR;
+
+RWStructuredBuffer<uint>    GhostPartOrderOldToNewRW;
+RWStructuredBuffer<uint>    GhostPartOrderNewToOldRW;
+
+StructuredBuffer<uint>      GhostPartNeighbourCellIndexR;
+RWStructuredBuffer<uint>    GhostPartNeighbourCellIndexRW;
+
+StructuredBuffer<uint>      PartGhostNeighboursR;
+RWStructuredBuffer<uint>    PartGhostNeighboursRW;
+
+StructuredBuffer<uint>      PartGhostNeighboursCountR;
+RWStructuredBuffer<uint>    PartGhostNeighboursCountRW;
+
+//== Structures ============================================================
+
+struct ContactQuery
+{
+    bool   Overlap;
+    float3 Point;
+    float4 Plane;
+    int    Type;
+};
+
+//== Functions =============================================================
+
+// ---- Contact info management ----
+
+uint MakeContactInfo(uint ID, uint Type, bool Valid)
+{
+    return (ID & 0xFFFFFFF)
+        | ((Type << 28) & 0x70000000)
+        | ((uint) Valid << 31);
+}
+
+uint GetContactID(uint Info)
+{
+    return Info & 0xFFFFFFF;
+}
+
+uint SetContactID(uint Info, uint ID)
+{
+    return (Info & ~0xFFFFFFF)
+        | (ID & 0xFFFFFFF);
+}
+
+uint GetContactType(uint Info)
+{
+    return (Info & 0x70000000) >> 28;
+}
+
+uint SetContactType(uint Info, uint Type)
+{
+    return (Info & ~0x70000000)
+        | ((Type << 28) & 0x70000000);
+}
+
+bool IsContactValid(uint Info)
+{
+    return (Info & 0x80000000) != 0;
+}
+
+uint SetContactValid(uint Info, bool Valid)
+{
+    return (Info & ~0x80000000)
+        | ((uint) Valid << 31);
+}
+
+int FindContactWithID(int Index, int NumContacts, uint ID)
+{
+    uint CtOffsi = Index;
+    ID &= 0xFFFFFFF;
+
+    for (int i = 0; i < NumContacts; ++i, CtOffsi += MaxParticles)
+    {
+        uint CtInfoi = PartCtInfoRW[CtOffsi];
+
+        if (GetContactID(CtInfoi) == ID)
+            return (int)CtOffsi;
+    }
+
+    return -1;
+}
+
+// ---- Contact detection procedures ----
+
+ContactQuery DetectGhostPartContact(float XijSqrNorm, float3 FluidPartPt, float3 GhostPartPt, float3 ClosestDir, float ClosestDist, int Type)
+{
+    ContactQuery Contact;
+
+    // Flex's approach: treat boundary and interior particles differently.
+    //if (Type == TYPE_BOUNDARY) Contact.Overlap = XijSqrNorm < ContactRadiusSqr;
+    //if (Type == TYPE_INTERIOR) Contact.Overlap = dot(FluidPartPt, Contact.Plane.xyz) + Contact.Plane.w < ContactRadius;
+
+    // Smoothest approach: treat all contacts as boundary.
+    Contact.Overlap = XijSqrNorm < ContactRadiusSqr;
+    Contact.Type = TYPE_BOUNDARY;
+    //Contact.Type = Type;
+    Contact.Point = GhostPartPt;
+    Contact.Plane = float4(ClosestDir, -dot(GhostPartPt, ClosestDir) + ClosestDist);
+
+    return Contact;
+}
+
+// ---- Neighbourhood Helpers ----
+
+inline int3 NnsCoordFromGhostPosition(float3 Position)
+{
+    int3 Coord = (int3) (Position * InvGhostNeighbourRadius);
+    Coord -= (int3) (Position < 0.0);
+    return Coord;
+}
+
+inline uint NnsBucketFromGhostCoord(int3 Coord)
+{
+    uint Bucket = MortonCode_10_3(Coord.x, Coord.y, Coord.z);
+    return Bucket % MaxGhostNeighbourBuckets;
+}
+
+inline uint NnsBucketFromGhostPosition(float3 Position)
+{
+    int3 Coord = NnsCoordFromGhostPosition(Position);
+    return NnsBucketFromGhostCoord(Coord);
+}
+
+//== Kernels ===============================================================
+
+[numthreads(256, 1, 1)]
+void KerUpdateGhostParts(const uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumGhostParts) return;
+
+    const uint TetId = GhostPartTetIdR[i];
+    const uint TriangleId = GhostPartClosestTriIdR[i];
+
+    const float3 TriBarycentricCoords = ReadVector3(GhostPartTriNTetBarycentricCoordsR, i, MaxGhostParts, float);
+    const float4 TetBarycentricCoords = ReadVector4(GhostPartTriNTetBarycentricCoordsR, i + 3 * MaxGhostParts, MaxGhostParts, float);
+
+    // Update ghost particle position according to its embedded barycentric coordinate.
+
+    const float3 Pos = VerticesR[TetraIndicesR[TetId + 0]] * TetBarycentricCoords.x +
+        VerticesR[TetraIndicesR[TetId + 1]] * TetBarycentricCoords.y +
+        VerticesR[TetraIndicesR[TetId + 2]] * TetBarycentricCoords.z +
+        VerticesR[TetraIndicesR[TetId + 3]] * TetBarycentricCoords.w;
+    const float3 OldPos = ReadVector3(GhostPartPositionR, i, MaxGhostParts, float);
+    const float3 DeltaPos = Pos - OldPos;
+    WriteVector3(GhostPartPositionRW, i, MaxGhostParts, Pos);
+    WriteVector3(GhostPartPositionDeltaRW, i, MaxGhostParts, DeltaPos);
+
+    // Update closest point in the surface, direction and distance.
+
+    const float3 ClosestSurfacePt = VerticesR[SurfaceIndicesR[TriangleId + 0]] * TriBarycentricCoords.x +
+        VerticesR[SurfaceIndicesR[TriangleId + 1]] * TriBarycentricCoords.y +
+        VerticesR[SurfaceIndicesR[TriangleId + 2]] * TriBarycentricCoords.z;
+
+    const float3 ClosestDir = Pos - ClosestSurfacePt;
+    const float ClosestDist = length(ClosestDir);
+    const int Type = GhostPartTypeRW[i];
+    const float Sgn = Type == TYPE_EXTERIOR ? -1.0 : 1.0;
+    GhostPartClosestDistRW[i] = Sgn * ClosestDist;
+    WriteVector3(GhostPartClosestDirRW, i, MaxGhostParts, (Sgn * ClosestDir / ClosestDist));
+}
+
+[numthreads(256, 1, 1)]
+void KerDetectGhostPartContacts(const uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    uint Ii = PartInfoRW[i];
+
+    // ----------------------------------------------------------------------
+
+    if (IsParticleInGroupMask(Ii, BehaviourTargetMask))
+    {
+        uint Ki = PartGhostNeighboursCountR[i];
+        if (Ki == 0) return;
+
+        ContactQuery Contact;
+        Contact.Overlap = false;
+
+        float3 Xi = ReadVector3(PartPositionR, i, MaxParticles, float);
+        float ClosestDist = OMEGA;
+        int ClosestColliderId = -1;
+        uint Si = i;
+
+        for (uint k = 0; k < Ki; ++k, Si += MaxParticles)
+        {
+            const uint j = PartGhostNeighboursR[Si];
+            const float3 Xj = ReadVector3(GhostPartPositionR, j, MaxGhostParts, float);
+            const float XijSqrNorm = SqrLength(Xi - Xj);
+
+            if (XijSqrNorm < ClosestDist)
+            {
+                ClosestDist = XijSqrNorm;
+                ClosestColliderId = GhostPartColliderIdR[j];
+
+                Contact = DetectGhostPartContact(XijSqrNorm,
+                    Xi,
+                    Xj,
+                    ReadVector3(GhostPartClosestDirR, j, MaxGhostParts, float),
+                    GhostPartClosestDistR[j],
+                    GhostPartTypeR[j]);
+
+            }
+        }
+
+        if (Contact.Overlap)
+        {
+            PartCtInfoRW[i] = MakeContactInfo(ClosestColliderId, Contact.Type, true);
+            PartCtFrictionCoeffRW[i] = ColliderFrictionCoeffR[ClosestColliderId];
+            WriteVector3(PartCtPointsNPlanesRW, i, MaxParticles, Contact.Point);
+            WriteVector4(PartCtPointsNPlanesRW, i + 3 * MaxParticles, MaxParticles, Contact.Plane);
+
+            PartCtCountRW[i] = 1;
+            Ii = SetParticleInContactFlag(Ii, true);
+            PartInfoRW[i] = Ii;
+        }
+
+        // ------------------------------------------------------------------
+    }
+}
+
+[numthreads(256, 1, 1)]
+void KerRearrangeContacts(const uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // ----------------------------------------------------------------------
+
+    uint Ii = PartInfoR[i];
+    uint j = PartOrderNewToOldR[i];
+
+    if ((j != NULL) && IsParticleInGroupMask(Ii, BehaviourTargetMask))
+    {
+        uint CtKj = PartCtCountR[j];
+        PartCtCountRW[i] = CtKj;
+
+        if (CtKj > 0)
+        {
+            PartCtInfoRW[i] = PartCtInfoR[j];
+            PartCtFrictionCoeffRW[i] = PartCtFrictionCoeffR[j];
+            CopyVector3(PartCtPointsNPlanesR, j, MaxParticles, PartCtPointsNPlanesRW, i, MaxParticles);
+            CopyVector3(PartCtPointsNPlanesR, j + 3 * MaxParticles, MaxParticles, PartCtPointsNPlanesRW, i + 3 * MaxParticles, MaxParticles);
+        }
+    }
+}
+
+void KerComputeDeltaImpl(const uint3 T, bool OnVelocities)
+{
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // ----------------------------------------------------------------------
+
+    uint Ii = PartInfoR[i];
+
+    if (IsParticleInGroupMask(Ii, BehaviourTargetMask))
+    {
+        float3 X0i = ReadVector3(PartPositionOldR, i, MaxParticles, float);
+        float3 Vi = ReadVector3(PartVelocityR, i, MaxParticles, float);
+        float3 Xi = OnVelocities ? (X0i + Vi * DeltaTime) : ReadVector3(PartPositionR, i, MaxParticles, float);
+        float3 XIi = Xi;
+
+        uint CtKi = PartCtCountR[i];
+        uint CtOffsi = i;
+
+        for (uint k = 0; k < CtKi; k++, CtOffsi += MaxParticles)
+        {
+            int Type = GetContactType(PartCtInfoR[CtOffsi]);
+            float3 Point = ReadVector3(PartCtPointsNPlanesR, CtOffsi, MaxParticles, float);
+            float4 Plane = ReadVector4(PartCtPointsNPlanesR, CtOffsi + 3 * MaxParticles, MaxParticles, float);
+            float FrictionCoeff = PartCtFrictionCoeffR[CtOffsi];
+            float PenetrationDepth = dot(Xi.xyz, Plane.xyz) + Plane.w - ContactRadius;
+
+            // Flex's approach.
+            /*
+            if (Type == TYPE_BOUNDARY)
+            {
+                float3 D = Xi - Point;
+                float L = length(D);
+                float C = L - ContactRadius;
+
+                if (C < 0.0)
+                {
+                    if (dot(D, Plane.xyz) > 0.0) D -= 2.0 * Plane.xyz * dot(D, Plane.xyz);
+                    Xi -= 0.5 * C * D / L;
+                }
+            }
+            else if (Type == TYPE_INTERIOR)
+            {
+                float C = PenetrationDepth;
+                if (C < 0.0) Xi -= Plane.xyz * C;
+            }
+            */
+
+            // Smoothest approach: just use the boundary particle case.
+            float3 D = Xi - Point;
+            float L = length(D);
+            float C = L - ContactRadius;
+
+            if (C < 0.0)
+            {
+                if (dot(D, Plane.xyz) > 0.0) D -= 2.0 * Plane.xyz * dot(D, Plane.xyz);
+                Xi -= C * D / L;
+            }
+
+            // Apply friction.
+            float3 dXiTan = TangentialComponent(X0i - Xi, Plane.xyz);
+            float  dXiTanLen = length(dXiTan);
+            float  dXiTanMaxLen = abs(PenetrationDepth) * FrictionCoeff;
+
+            if (dXiTanLen > 0.0)
+            {
+                if (dXiTanLen > dXiTanMaxLen) dXiTan *= dXiTanMaxLen / dXiTanLen;
+                Xi += dXiTan;
+            }
+        }
+
+        float3 dXi = (Xi - XIi);
+        if (OnVelocities) dXi *= InvDeltaTime;
+        dXi *= Stiffness;
+
+        AddVector3(PartDeltaRW, i, MaxParticles, dXi);
+    }
+}
+
+[numthreads(256, 1, 1)]
+void KerComputeDeltaOnPositions(const uint3 T : SV_DispatchThreadID)
+{
+    KerComputeDeltaImpl(T, false);
+}
+
+[numthreads(256, 1, 1)]
+void KerComputeDeltaOnVelocities(const uint3 T : SV_DispatchThreadID)
+{
+    KerComputeDeltaImpl(T, true);
+}
+
+
+//------------NEIGHBOURHOOD SEARCH ----------------//
+
+[numthreads(256, 1, 1)]
+void KerOrderByNeighbourhood(const uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumGhostParts) return;
+
+    float3 Xi = ReadVector3(GhostPartPositionR, i, MaxGhostParts, float);
+
+    uint Bucket = NnsBucketFromGhostPosition(Xi);
+    GhostNeighbourSearchTuplesRW[i] = uint2(Bucket, i);
+}
+
+[numthreads(256, 1, 1)]
+void KerRearrangeParticlesA(uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumGhostParts) return;
+
+    const uint2 TT = GhostNeighbourSearchTuplesR[i];
+    const uint j = TT.y;
+
+    CopyVector3(GhostPartPositionR, j, MaxGhostParts, GhostPartPositionRW, i, MaxGhostParts);
+    CopyVector3(GhostPartPositionDeltaR, j, MaxGhostParts, GhostPartPositionDeltaRW, i, MaxGhostParts);
+    GhostPartColliderIdRW[i] = GhostPartColliderIdR[j];
+    GhostPartTypeRW[i] = GhostPartTypeR[j];
+    GhostPartClosestDistRW[i] = GhostPartClosestDistR[j];
+    CopyVector3(GhostPartClosestDirR, j, MaxGhostParts, GhostPartClosestDirRW, i, MaxGhostParts);
+}
+
+[numthreads(256, 1, 1)]
+void KerRearrangeParticlesB(uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumGhostParts) return;
+
+    const uint2 TT = GhostNeighbourSearchTuplesR[i];
+    const uint j = TT.y;
+
+    GhostPartTetIdRW[i] = GhostPartTetIdR[j];
+    GhostPartClosestTriIdRW[i] = GhostPartClosestTriIdR[j];
+    GhostPartIsSurfaceRW[i] = GhostPartIsSurfaceR[j];
+    CopyVector3(GhostPartTriNTetBarycentricCoordsR, j, MaxGhostParts, GhostPartTriNTetBarycentricCoordsRW, i, MaxGhostParts);
+    CopyVector4(GhostPartTriNTetBarycentricCoordsR, j + 3 * MaxGhostParts, MaxGhostParts, GhostPartTriNTetBarycentricCoordsRW, i + 3 * MaxGhostParts, MaxGhostParts);
+
+    GhostPartOrderOldToNewRW[j] = i;
+    GhostPartOrderNewToOldRW[i] = j;
+    GhostPartNeighbourCellIndexRW[i] = TT.x;
+}
+
+
+[numthreads(256, 1, 1)]
+void KerFindGhostNeighbours(uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumParticles) return;
+
+    // --------------------------------------------------------------------
+
+    float3 Xi = ReadVector3(PartPositionR, i, MaxParticles, float);
+    int3   Ci = NnsCoordFromGhostPosition(Xi);
+
+    // --------------------------------------------------------------------
+
+    uint Buckets[27];
+    Buckets[0] = NnsBucketFromGhostCoord(Ci + int3(0, 0, 0));
+    Buckets[1] = NnsBucketFromGhostCoord(Ci + int3(1, 0, 0));
+    Buckets[2] = NnsBucketFromGhostCoord(Ci + int3(-1, 0, 0));
+    Buckets[3] = NnsBucketFromGhostCoord(Ci + int3(0, 1, 0));
+    Buckets[4] = NnsBucketFromGhostCoord(Ci + int3(0, -1, 0));
+    Buckets[5] = NnsBucketFromGhostCoord(Ci + int3(0, 0, 1));
+    Buckets[6] = NnsBucketFromGhostCoord(Ci + int3(0, 0, -1));
+    Buckets[7] = NnsBucketFromGhostCoord(Ci + int3(1, 1, 0));
+    Buckets[8] = NnsBucketFromGhostCoord(Ci + int3(-1, 1, 0));
+    Buckets[9] = NnsBucketFromGhostCoord(Ci + int3(1, -1, 0));
+    Buckets[10] = NnsBucketFromGhostCoord(Ci + int3(-1, -1, 0));
+    Buckets[11] = NnsBucketFromGhostCoord(Ci + int3(0, 1, 1));
+    Buckets[12] = NnsBucketFromGhostCoord(Ci + int3(0, 1, -1));
+    Buckets[13] = NnsBucketFromGhostCoord(Ci + int3(0, -1, 1));
+    Buckets[14] = NnsBucketFromGhostCoord(Ci + int3(0, -1, -1));
+    Buckets[15] = NnsBucketFromGhostCoord(Ci + int3(1, 0, 1));
+    Buckets[16] = NnsBucketFromGhostCoord(Ci + int3(1, 0, -1));
+    Buckets[17] = NnsBucketFromGhostCoord(Ci + int3(-1, 0, 1));
+    Buckets[18] = NnsBucketFromGhostCoord(Ci + int3(-1, 0, -1));
+    Buckets[19] = NnsBucketFromGhostCoord(Ci + int3(-1, -1, -1));
+    Buckets[20] = NnsBucketFromGhostCoord(Ci + int3(1, -1, -1));
+    Buckets[21] = NnsBucketFromGhostCoord(Ci + int3(-1, 1, -1));
+    Buckets[22] = NnsBucketFromGhostCoord(Ci + int3(1, 1, -1));
+    Buckets[23] = NnsBucketFromGhostCoord(Ci + int3(-1, -1, 1));
+    Buckets[24] = NnsBucketFromGhostCoord(Ci + int3(1, -1, 1));
+    Buckets[25] = NnsBucketFromGhostCoord(Ci + int3(-1, 1, 1));
+    Buckets[26] = NnsBucketFromGhostCoord(Ci + int3(1, 1, 1));
+
+    // --------------------------------------------------------------------
+
+    uint w = 0;
+    if (Buckets[0] != NULL)  for (w = 1; w < 27; ++w)  if (Buckets[w] == Buckets[0]) Buckets[w] = NULL;
+    if (Buckets[1] != NULL)  for (w = 2; w < 27; ++w)  if (Buckets[w] == Buckets[1]) Buckets[w] = NULL;
+    if (Buckets[2] != NULL)  for (w = 3; w < 27; ++w)  if (Buckets[w] == Buckets[2]) Buckets[w] = NULL;
+    if (Buckets[3] != NULL)  for (w = 4; w < 27; ++w)  if (Buckets[w] == Buckets[3]) Buckets[w] = NULL;
+    if (Buckets[4] != NULL)  for (w = 5; w < 27; ++w)  if (Buckets[w] == Buckets[4]) Buckets[w] = NULL;
+    if (Buckets[5] != NULL)  for (w = 6; w < 27; ++w)  if (Buckets[w] == Buckets[5]) Buckets[w] = NULL;
+    if (Buckets[6] != NULL)  for (w = 7; w < 27; ++w)  if (Buckets[w] == Buckets[6]) Buckets[w] = NULL;
+    if (Buckets[7] != NULL)  for (w = 8; w < 27; ++w)  if (Buckets[w] == Buckets[7]) Buckets[w] = NULL;
+    if (Buckets[8] != NULL)  for (w = 9; w < 27; ++w)  if (Buckets[w] == Buckets[8]) Buckets[w] = NULL;
+    if (Buckets[9] != NULL)  for (w = 10; w < 27; ++w) if (Buckets[w] == Buckets[9]) Buckets[w] = NULL;
+    if (Buckets[10] != NULL) for (w = 11; w < 27; ++w) if (Buckets[w] == Buckets[10]) Buckets[w] = NULL;
+    if (Buckets[11] != NULL) for (w = 12; w < 27; ++w) if (Buckets[w] == Buckets[11]) Buckets[w] = NULL;
+    if (Buckets[12] != NULL) for (w = 13; w < 27; ++w) if (Buckets[w] == Buckets[12]) Buckets[w] = NULL;
+    if (Buckets[13] != NULL) for (w = 14; w < 27; ++w) if (Buckets[w] == Buckets[13]) Buckets[w] = NULL;
+    if (Buckets[14] != NULL) for (w = 15; w < 27; ++w) if (Buckets[w] == Buckets[14]) Buckets[w] = NULL;
+    if (Buckets[15] != NULL) for (w = 16; w < 27; ++w) if (Buckets[w] == Buckets[15]) Buckets[w] = NULL;
+    if (Buckets[16] != NULL) for (w = 17; w < 27; ++w) if (Buckets[w] == Buckets[16]) Buckets[w] = NULL;
+    if (Buckets[17] != NULL) for (w = 18; w < 27; ++w) if (Buckets[w] == Buckets[17]) Buckets[w] = NULL;
+    if (Buckets[18] != NULL) for (w = 19; w < 27; ++w) if (Buckets[w] == Buckets[18]) Buckets[w] = NULL;
+    if (Buckets[19] != NULL) for (w = 20; w < 27; ++w) if (Buckets[w] == Buckets[19]) Buckets[w] = NULL;
+    if (Buckets[20] != NULL) for (w = 21; w < 27; ++w) if (Buckets[w] == Buckets[20]) Buckets[w] = NULL;
+    if (Buckets[21] != NULL) for (w = 22; w < 27; ++w) if (Buckets[w] == Buckets[21]) Buckets[w] = NULL;
+    if (Buckets[22] != NULL) for (w = 23; w < 27; ++w) if (Buckets[w] == Buckets[22]) Buckets[w] = NULL;
+    if (Buckets[23] != NULL) for (w = 24; w < 27; ++w) if (Buckets[w] == Buckets[23]) Buckets[w] = NULL;
+    if (Buckets[24] != NULL) for (w = 25; w < 27; ++w) if (Buckets[w] == Buckets[24]) Buckets[w] = NULL;
+    if (Buckets[w] == Buckets[25]) Buckets[w] = NULL;
+
+    // --------------------------------------------------------------------
+
+    uint Si = i;
+    uint Ki = 0;
+
+    for (uint k = 0; (k < 27) && (Ki < MaxGhostNeighbours); ++k)
+    {
+        if (Buckets[k] == NULL)
+            continue;
+
+        uint BucketBegin = GhostNeighbourSearchOffsetR[Buckets[k]];
+        uint BucketLen = GhostNeighbourSearchCountR[Buckets[k]];
+
+        if (BucketLen == 0)
+            continue;
+
+        uint BucketEnd = BucketBegin + BucketLen;
+        uint BucketSearchStart = BucketBegin + i % BucketLen;
+        uint j;
+
+        for (j = BucketSearchStart; (j < BucketEnd) && (Ki < MaxGhostNeighbours); j++)
+        {
+            if (i == j)
+                continue;
+
+            float3 Xj = ReadVector3(GhostPartPositionR, j, MaxGhostParts, float);
+            float3 Xij = Xi - Xj;
+
+            if (dot(Xij, Xij) <= GhostNeighbourRadiusSqr)
+            {
+                PartGhostNeighboursRW[Si] = j;
+                Si += MaxParticles;
+                Ki++;
+            }
+        }
+
+        for (j = BucketBegin; (j < BucketSearchStart) && (Ki < MaxGhostNeighbours); j++)
+        {
+            if (i == j) continue;
+
+            float3 Xj = ReadVector3(GhostPartPositionR, j, MaxGhostParts, float);
+            float3 Xij = Xi - Xj;
+
+            if (dot(Xij, Xij) <= GhostNeighbourRadiusSqr)
+            {
+                PartGhostNeighboursRW[Si] = j;
+                Si += MaxParticles;
+                Ki++;
+            }
+        }
+    }
+
+    PartGhostNeighboursCountRW[i] = Ki;
+}
+
+[numthreads(256, 1, 1)]
+void KerInterpolateVertices(uint3 T : SV_DispatchThreadID)
+{
+    const uint i = T.x;
+    if (i >= NumVertices) return;
+    VerticesRW[i] = lerp(VerticesPrevR[i], VerticesNextR[i], InterpolationWeight);
+}
